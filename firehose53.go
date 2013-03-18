@@ -12,8 +12,8 @@
    Results are output as JSON for future analysis.
 
    The default configuration yields ~1666 QPS to localhost on a MacBook Air
-   running Unbound.  Changing the flags to use 4 processors and 30 threads
-   increases this to 2500 QPS.
+   running Unbound with cached queries. Changing the flags to use 4 processors
+   and 30 threads can increase the rate to 2500 QPS.
 */
 
 // Copyright 2013 Thomas Stromberg. All rights reserved.
