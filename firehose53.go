@@ -11,9 +11,8 @@
 
    Results are output as JSON for future analysis.
 
-   The default configuration yields ~1666 QPS to localhost on a MacBook Air
-   running Unbound with cached queries. Changing the flags to use 4 processors
-   and 30 threads can increase the rate to 2500 QPS.
+   The default configuration yields ~1450 QPS on a MacBook Air via localhost.
+   Increasing the thread and processor count can double this number.
 */
 
 // Copyright 2013 Thomas Stromberg. All rights reserved.
@@ -37,11 +36,11 @@ import (
 )
 
 var numCores = flag.Int("j", 2, "number of cores to use")
-var numThreads = flag.Int("t", 8, "number of threads to use")
+var numThreads = flag.Int("t", 2, "number of threads to use")
 var inputRecords = flag.String("r", "A a.root-servers.net.",
 	"Records to query")
 var inputFile = flag.String("f", "", "File with records to query")
-var quietMode = flag.Bool("q", true, "Quiet mode")
+var quietMode = flag.Bool("q", false, "Quiet mode")
 
 type Request struct {
 	Server      string
@@ -123,40 +122,41 @@ func process_ip_args(ip_args []string) []string {
 // and returns the results to the results channel.
 func start_worker(queue <-chan *Request, results chan<- *Result) {
 	for request := range queue {
-		if request.is_complete {
-			break
-		}
 		result := query(request)
 		results <- &result
 	}
 }
 
 // For a given record string, add an item to the queue for each ip_port combination.
-func queue_record(ip_ports []string, record string, queue chan<- *Request) {
+func queue_record(ip_ports []string, record string, queue chan<- *Request) int64 {
 	record_parts := strings.SplitN(record, " ", 2)
+	count := int64(0)
 	for _, ip_port := range ip_ports {
 		request := Request{ip_port, record_parts[0], record_parts[1], false}
 		queue <- &request
+		count++
 	}
+	return count
 }
 
 // For a comma delimited string, add each record for each ip_port combination to the queue
-func queue_records_from_str(ip_ports []string, records string, queue chan<- *Request) {
-	record_count := 0
+func queue_records_from_str(ip_ports []string, records string, queue chan<- *Request) int64 {
+	count := int64(0)
 	for _, record := range strings.Split(*inputRecords, ",") {
-		record_count = record_count + 1
-		queue_record(ip_ports, record, queue)
+		count = count + queue_record(ip_ports, record, queue)
 	}
-	log.Printf("Read %d record(s) from string", record_count)
+	log.Printf("Generated %d requests(s) from string", count)
+	close(queue)
+	return count
 }
 
 // For a path, add each record within for each ip_port combination to the queue
-func queue_records_from_path(ip_ports []string, path string, queue chan<- *Request) {
-	record_count := 0
+func queue_records_from_path(ip_ports []string, path string, queue chan<- *Request) int64 {
+	count := int64(0)
 	file, err := os.Open(path)
 	if err != nil {
-		log.Println(err)
-		return
+		log.Printf("Open error: %s", err)
+		return count
 	}
 	defer file.Close()
 	buf := bufio.NewReader(file)
@@ -165,33 +165,25 @@ func queue_records_from_path(ip_ports []string, path string, queue chan<- *Reque
 		if err != nil {
 			if err != io.EOF || len(line) > 0 {
 				log.Println(err)
-				return
+				return count
 			}
 			break
 		}
-		record_count = record_count + 1
-		queue_record(ip_ports, strings.TrimRight(line, "\n"), queue)
+		added := queue_record(ip_ports, strings.TrimRight(line, "\n"), queue)
+		count = count + added
 	}
-	log.Printf("Read %d record(s) from %s", record_count, path)
+	log.Printf("Generated %d request(s) from %s", count, path)
+	close(queue)
+	return count
 }
 
 // Watch the results channel for newly completed queuries, output summary in JSON to stdout
-func display_results(results <-chan *Result, start_time time.Time) {
+func display_results(results <-chan *Result, start_time time.Time,
+	expected_count int64) {
 	counter := int64(0)
 	error_counter := int64(0)
 	for {
 		result := <-results
-
-		if result.is_complete {
-			// TODO: add QPS calculation here
-			log.Printf("%d answers / %d errors received\n", counter,
-				error_counter)
-			log.Printf("Duration: %s", time.Since(start_time))
-			qps := counter / int64(time.Since(start_time)/time.Second)
-			log.Printf("QPS: %d", qps)
-			break
-		}
-
 		counter = counter + 1
 		if result.Error != "" {
 			error_counter = error_counter + 1
@@ -204,39 +196,43 @@ func display_results(results <-chan *Result, start_time time.Time) {
 			}
 			fmt.Println(string(output))
 		}
+		if counter == expected_count {
+			qps := (float64(counter) / float64(time.Since(start_time))) * float64(time.Second)
+			log.Printf("%d answers / %d errors received in %s (%2.2f QPS)\n", counter,
+				error_counter, time.Since(start_time), qps)
+			return
+		}
+
 	}
 }
 
 func main() {
 	flag.Parse()
 	runtime.GOMAXPROCS(*numCores)
-	request_channel := make(chan *Request)
-	result_channel := make(chan *Result)
-	start_time := time.Now()
+	log.Printf("Started: %d cores, %d threads", *numCores, *numThreads)
 
-	// Create workers with blocking channels
+	// TODO: Lower queue size once deadlock is worked out.
+	request_channel := make(chan *Request, 50000)
+	result_channel := make(chan *Result, 50000)
+
 	for i := 0; i < *numThreads; i++ {
 		go start_worker(request_channel, result_channel)
 	}
 
 	// Send all proposed requests into the queue
 	ip_ports := process_ip_args(flag.Args())
-
-	// Display results as they come in.
-	go display_results(result_channel, start_time)
+	record_count := int64(0)
+	start_time := time.Now()
 
 	if *inputFile != "" {
-		queue_records_from_path(ip_ports, *inputFile, request_channel)
+		record_count = queue_records_from_path(ip_ports, *inputFile, request_channel)
 	} else {
-		queue_records_from_str(ip_ports, *inputRecords, request_channel)
+		record_count = queue_records_from_str(ip_ports, *inputRecords, request_channel)
 	}
-
-	// Tell all of the threads to die once the queue is closed
-	for i := 0; i < *numThreads; i++ {
-		request_channel <- &Request{is_complete: true}
+	if record_count == 0 {
+		log.Printf("Nothing to do")
+	} else {
+		// Display results as they come in.
+		display_results(result_channel, start_time, record_count)
 	}
-	result_channel <- &Result{is_complete: true}
-
-	// TODO: Remove hack which makes sure log messages are emitted.
-	time.Sleep(1 * time.Millisecond)
 }
