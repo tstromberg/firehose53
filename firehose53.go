@@ -10,9 +10,6 @@
    This uses 32 threads, and 4 processors to send these records to these IP's.
 
    Results are output as JSON for future analysis, unless -q is provided.
-
-   The default configuration yields ~1450 QPS on a MacBook Air via localhost.
-   Increasing the thread and processor count can double this number.
 */
 
 // Copyright 2013 Thomas Stromberg. All rights reserved.
@@ -192,14 +189,16 @@ func display_results(results <-chan *Result, count <-chan int64, quit chan bool)
 	// This assumes that display_results is called before queue_*
 	start_time := time.Now()
 	for {
-		select {
-		case expected_count = <-count:
-			// Now we know the count, nothing else to do.
-		default:
-			// No new information, still nothing to do. Removing the default:
-			// block will however result in a deadlock.
-		}
-
+		// We're seeing results before everything has queued up!
+		if expected_count == -1 {
+			select {
+			case expected_count = <-count:
+				// Now we know the count, nothing else to do.
+			default:
+				// No new information, still nothing to do. Removing the default:
+				// block will however result in a deadlock.
+			}
+		} 
 		// This must come before we block on the results channel to avoid deadlock
 		if counter == expected_count {
 			qps := (float64(counter) / float64(time.Since(start_time))) * float64(time.Second)
