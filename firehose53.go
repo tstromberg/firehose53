@@ -9,7 +9,7 @@
 
    This uses 32 threads, and 4 processors to send these records to these IP's.
 
-   Results are output as JSON for future analysis.
+   Results are output as JSON for future analysis, unless -q is provided.
 
    The default configuration yields ~1450 QPS on a MacBook Air via localhost.
    Increasing the thread and processor count can double this number.
@@ -35,6 +35,11 @@ import (
 	"time"
 )
 
+const (
+	// How many requests/responses can be in the queue before blocking.
+	QUEUE_LENGTH = 65535
+)
+
 var numCores = flag.Int("j", 2, "number of cores to use")
 var numThreads = flag.Int("t", 2, "number of threads to use")
 var inputRecords = flag.String("r", "A a.root-servers.net.",
@@ -43,10 +48,9 @@ var inputFile = flag.String("f", "", "File with records to query")
 var quietMode = flag.Bool("q", false, "Quiet mode")
 
 type Request struct {
-	Server      string
-	RecordType  string
-	RecordName  string
-	is_complete bool
+	Server     string
+	RecordType string
+	RecordName string
 }
 
 type Answer struct {
@@ -123,6 +127,7 @@ func process_ip_args(ip_args []string) []string {
 func start_worker(queue <-chan *Request, results chan<- *Result) {
 	for request := range queue {
 		result := query(request)
+		// This will block if the result queue is full.
 		results <- &result
 	}
 }
@@ -132,7 +137,8 @@ func queue_record(ip_ports []string, record string, queue chan<- *Request) int64
 	record_parts := strings.SplitN(record, " ", 2)
 	count := int64(0)
 	for _, ip_port := range ip_ports {
-		request := Request{ip_port, record_parts[0], record_parts[1], false}
+		request := Request{ip_port, record_parts[0], record_parts[1]}
+		// This will block if the request queue is full.
 		queue <- &request
 		count++
 	}
@@ -178,15 +184,35 @@ func queue_records_from_path(ip_ports []string, path string, queue chan<- *Reque
 }
 
 // Watch the results channel for newly completed queuries, output summary in JSON to stdout
-func display_results(results <-chan *Result, start_time time.Time,
-	expected_count int64) {
+func display_results(results <-chan *Result, count <-chan int64, quit chan bool) {
 	counter := int64(0)
 	error_counter := int64(0)
+	expected_count := int64(-1)
+
+	// This assumes that display_results is called before queue_*
+	start_time := time.Now()
 	for {
+		select {
+		case expected_count = <-count:
+			// Now we know the count, nothing else to do.
+		default:
+			// No new information, still nothing to do. Removing the default:
+			// block will however result in a deadlock.
+		}
+
+		// This must come before we block on the results channel to avoid deadlock
+		if counter == expected_count {
+			qps := (float64(counter) / float64(time.Since(start_time))) * float64(time.Second)
+			log.Printf("%d answers / %d errors received in %s (%2.2f QPS)\n", counter,
+				error_counter, time.Since(start_time), qps)
+			quit <- true
+		}
+
+		// block until a new result is available
 		result := <-results
-		counter = counter + 1
+		counter++
 		if result.Error != "" {
-			error_counter = error_counter + 1
+			error_counter++
 		}
 		if *quietMode != true {
 			output, err := json.Marshal(result)
@@ -196,13 +222,6 @@ func display_results(results <-chan *Result, start_time time.Time,
 			}
 			fmt.Println(string(output))
 		}
-		if counter == expected_count {
-			qps := (float64(counter) / float64(time.Since(start_time))) * float64(time.Second)
-			log.Printf("%d answers / %d errors received in %s (%2.2f QPS)\n", counter,
-				error_counter, time.Since(start_time), qps)
-			return
-		}
-
 	}
 }
 
@@ -211,28 +230,36 @@ func main() {
 	runtime.GOMAXPROCS(*numCores)
 	log.Printf("Started: %d cores, %d threads", *numCores, *numThreads)
 
-	// TODO: Lower queue size once deadlock is worked out.
-	request_channel := make(chan *Request, 50000)
-	result_channel := make(chan *Result, 50000)
+	requests := make(chan *Request, QUEUE_LENGTH)
+	results := make(chan *Result, QUEUE_LENGTH)
 
 	for i := 0; i < *numThreads; i++ {
-		go start_worker(request_channel, result_channel)
+		go start_worker(requests, results)
 	}
 
-	// Send all proposed requests into the queue
 	ip_ports := process_ip_args(flag.Args())
 	record_count := int64(0)
-	start_time := time.Now()
 
+	// Display results as soon as they are processed. If this is not started
+	// before queue_records_from_path, the workers may deadlock waiting for
+	// the results to clear up.
+	count_chan := make(chan int64) // used to communicate the record count later
+	quit := make(chan bool)        // used to tell us once it has seen the count
+	go display_results(results, count_chan, quit)
+
+	// Send all proposed requests into the queue
 	if *inputFile != "" {
-		record_count = queue_records_from_path(ip_ports, *inputFile, request_channel)
+		record_count = queue_records_from_path(ip_ports, *inputFile, requests)
 	} else {
-		record_count = queue_records_from_str(ip_ports, *inputRecords, request_channel)
+		record_count = queue_records_from_str(ip_ports, *inputRecords, requests)
 	}
+
+	// Now tht we know the total, send it to the display_results coroutine
+	count_chan <- record_count
 	if record_count == 0 {
 		log.Printf("Nothing to do")
-	} else {
-		// Display results as they come in.
-		display_results(result_channel, start_time, record_count)
 	}
+
+	// Block until display_results has completed
+	<-quit
 }
